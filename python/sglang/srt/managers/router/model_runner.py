@@ -4,7 +4,6 @@ from typing import List
 
 import numpy as np
 import torch
-from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.managers.router.infer_batch import Batch, ForwardMode
 from sglang.srt.memory_pool import ReqToTokenPool, TokenToKVPool
 from sglang.srt.parallel_utils.parallel_state import initialize_model_parallel
@@ -278,6 +277,8 @@ class ModelRunner:
                     self.model_config.hf_config, "quantization_config", None
                 )
                 if hf_quant_config is not None:
+                    from sglang.srt.layers.quantization.awq import AWQConfig
+
                     # TODO: config quantization awq etc
                     quant_config = AWQConfig.from_config(hf_quant_config)
                     print(f"quant_config: {quant_config}")

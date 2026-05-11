@@ -7,7 +7,7 @@ name = "nano-sglang"
 version = "0.0.1"
 description = "nano SGLang: LLM inference framework"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { file = "LICENSE" }
 classifiers = ["Programming Language :: Python :: 3"]
 dependencies = ["requests"]
@@ -18,8 +18,8 @@ all = [
     "psutil",
     "rpyc",
     "torch>=2.8.0",
-    "transformers",
-    "triton",
+    "transformers>=4.33,<5",
+    "triton; platform_system == 'Linux' and platform_machine == 'x86_64'",
     "uvloop",
     "uvicorn",
     "zmq",
@@ -29,7 +29,7 @@ all = [
     "tqdm",
     "numpy",
     "requests",
-    "huggingface_hub",
+    "huggingface_hub<1.0",
     "safetensors",
     "Pillow",
     "filelock",
