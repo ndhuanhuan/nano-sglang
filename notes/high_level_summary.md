@@ -159,6 +159,61 @@ That last part is the streaming trick.
 
 The HTTP coroutine is not polling the model. It is sleeping until some other part of the system says, "new text for request `rid` is ready."
 
+More concretely, `await event.wait()` means:
+
+- this request coroutine pauses immediately
+- the asyncio event loop is free to run other tasks
+- this coroutine will not continue until somebody calls `event.set()` for this request
+
+So the request path does not look like this:
+
+```python
+while not finished:
+	check_model_status()
+```
+
+That would be polling.
+
+Instead, it looks like this:
+
+```python
+send_request_to_router(rid)
+await event.wait()
+yield newest_text_chunk
+```
+
+That is why I called it "sleeping." The coroutine is suspended at `await event.wait()` and does no work until it is woken up.
+
+The wake-up path is:
+
+1. Router generates token IDs.
+2. Detokenizer turns token IDs into text.
+3. `TokenizerManager.handle_loop()` receives that text.
+4. It looks up `rid` in `rid_to_state`.
+5. It appends the new output chunk.
+6. It calls `state.event.set()`.
+7. The sleeping request coroutine resumes and yields the chunk to FastAPI.
+
+Here is the same idea as a small sequence diagram:
+
+```text
+HTTP request coroutine                 background handle_loop
+----------------------                ----------------------
+send tokenized request  ----------->  runtime keeps working elsewhere
+await event.wait()      -- sleep -->  recv text for rid from detokenizer
+									  rid_to_state[rid].out_list.append(...)
+									  rid_to_state[rid].event.set()
+resume after wait       <----------   event wakes this coroutine
+yield text chunk        ----------->  StreamingResponse sends bytes to client
+```
+
+So the important distinction is:
+
+- the router side is actively advancing inference
+- the HTTP coroutine is passively waiting for a signal
+
+Only the waiting HTTP coroutine is "not polling." The overall system is still making progress in the background.
+
 ## 4. The return path is another loop, not a callback
 
 The background producer is `TokenizerManager.handle_loop()`:
