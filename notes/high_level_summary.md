@@ -1,0 +1,595 @@
+# How Inference Works In Nano SGLang
+
+This note is the "connect the dots" version of Lessons 1 to 3.
+
+If the first three lessons felt disconnected, the simplest way to recover is to stop thinking about them as three separate topics:
+
+- Lesson 1 explains where each runtime role lives.
+- Lesson 2 explains how results get back to the client without blocking.
+- Lesson 3 explains how the router decides what the GPU should do next.
+
+They are all describing one request pipeline.
+
+## The one mental model to keep in your head
+
+When a user sends a prompt, nano-sglang does this:
+
+1. FastAPI receives the HTTP request.
+2. `TokenizerManager` turns text into token IDs.
+3. The router converts that request into internal scheduler state.
+4. The router chooses between `EXTEND` and `DECODE` work.
+5. `ModelRunner` executes the actual GPU forward pass.
+6. The router sends generated token IDs to the detokenizer.
+7. The detokenizer turns token IDs into text.
+8. `TokenizerManager` wakes the waiting HTTP coroutine and streams the text back.
+
+So the full inference loop is:
+
+```text
+HTTP -> TokenizerManager -> Router -> ModelRunner -> Detokenizer -> TokenizerManager -> HTTP stream
+```
+
+That is the runtime.
+
+## 1. Lesson 1 in one picture: who owns what
+
+The entrypoint is `python/sglang/srt/server.py`.
+
+This snippet is the first thing to internalize:
+
+```python
+def launch_server(server_args):
+	can_use_ports = alloc_usable_network_port(
+		num=4 + server_args.tp_size, used_list=(server_args.port,)
+	)
+	port_args = PortArgs(
+		tokenizer_port=can_use_ports[0],
+		router_port=can_use_ports[1],
+		detokenizer_port=can_use_ports[2],
+		nccl_port=can_use_ports[3],
+		model_rpc_ports=can_use_ports[4:],
+	)
+
+	tokenizer_manager = TokenizerManager(server_args, port_args)
+
+	proc_router = mp.Process(
+		target=start_router_process,
+		args=(server_args, port_args, pipe_router_writer),
+	)
+	proc_detoken = mp.Process(
+		target=start_detokenizer_process,
+		args=(server_args, port_args, pipe_detoken_writer),
+	)
+```
+
+This tells you the runtime is not a single monolithic server.
+
+It is split into:
+
+- main process: FastAPI + `TokenizerManager`
+- router process: scheduling + model stepping
+- detokenizer process: token IDs back to strings
+- optional model RPC workers when `tp_size > 1`
+
+That is why Lesson 1 focused so much on processes and ports. It was not setup trivia. It was telling you the boundaries of the inference pipeline.
+
+## 2. The HTTP handler is thin on purpose
+
+The `/generate` endpoint does almost nothing by itself:
+
+```python
+@app.post("/generate")
+async def generate_request(obj: GenerateReqInput):
+	obj.post_init()
+	result_generator = tokenizer_manager.generate_request(obj)
+
+	if obj.stream:
+		async def stream_results():
+			async for out in result_generator:
+				yield (json.dumps(out) + "\0").encode("utf-8")
+
+		return StreamingResponse(stream_results(), media_type="text/event-stream")
+	else:
+		ret = await result_generator.__anext__()
+		return ret
+```
+
+Important point: the FastAPI layer does not run inference.
+
+It just:
+
+- normalizes the input
+- asks `TokenizerManager` for an async generator
+- either streams chunks from it or waits for one final result
+
+So if you want to understand inference, do not stare at `server.py` for too long. The real behavior starts in `TokenizerManager`.
+
+## 3. Lesson 2 in code: TokenizerManager is the bridge between HTTP and the runtime
+
+`TokenizerManager.generate_request(...)` is where user input becomes runtime work.
+
+This is the key part:
+
+```python
+async def generate_request(self, obj: GenerateReqInput):
+	if self.to_create_loop:
+		await self.create_handle_loop()
+
+	rid = obj.rid
+	input_ids = self.tokenizer.encode(obj.text)
+	sampling_params = SamplingParams(**obj.sampling_params)
+
+	tokenized_obj = TokenizedGenerateReqInput(
+		rid=rid,
+		input_ids=input_ids,
+		pixel_values=pixel_values,
+		image_hash=image_hash,
+		sampling_params=sampling_params,
+		return_normalized_logprob=obj.return_normalized_logprob,
+		normalized_logprob_start_len=obj.normalized_logprob_start_len,
+		stream=obj.stream,
+	)
+	self.send_to_router.send_pyobj(tokenized_obj)
+
+	event = asyncio.Event()
+	state = ReqState([], False, event, lock)
+	self.rid_to_state[rid] = state
+
+	while True:
+		await event.wait()
+		yield state.out_list[-1]
+		state.out_list = []
+		if state.finished:
+			del self.rid_to_state[rid]
+			break
+		event.clear()
+```
+
+This one snippet explains most of Lesson 2.
+
+What changes here?
+
+- text becomes `input_ids`
+- request parameters become `SamplingParams`
+- user-facing input becomes `TokenizedGenerateReqInput`
+- the request gets a per-request wait point: `ReqState`
+- the caller then suspends on `await event.wait()`
+
+That last part is the streaming trick.
+
+The HTTP coroutine is not polling the model. It is sleeping until some other part of the system says, "new text for request `rid` is ready."
+
+## 4. The return path is another loop, not a callback
+
+The background producer is `TokenizerManager.handle_loop()`:
+
+```python
+async def handle_loop(self):
+	while True:
+		recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+
+		if isinstance(recv_obj, BatchStrOut):
+			for i, rid in enumerate(recv_obj.rids):
+				out_dict = {
+					"text": recv_obj.output_str[i],
+					"meta_info": recv_obj.meta_info[i],
+				}
+				state = self.rid_to_state[rid]
+				state.out_list.append(out_dict)
+				state.finished = recv_obj.finished[i]
+				state.event.set()
+```
+
+This is the other half of the Lesson 2 design.
+
+- `generate_request(...)` is the consumer loop for one request.
+- `handle_loop()` is the producer loop for all requests.
+
+The shared rendezvous point is `rid_to_state`.
+
+That is why Lesson 2 kept repeating the producer-consumer idea. It is the exact mechanism that converts background inference progress into streaming HTTP output.
+
+## 5. The router is the scheduling brain
+
+The router process has two loops in `python/sglang/srt/managers/router/manager.py`:
+
+```python
+async def loop_for_recv_requests(self):
+	while True:
+		recv_req = await self.recv_from_tokenizer.recv_pyobj()
+		self.recv_reqs.append(recv_req)
+
+async def loop_for_forward(self):
+	while True:
+		next_step_input = list(self.recv_reqs)
+		self.recv_reqs = []
+		out_pyobjs = await self.model_client.step(next_step_input)
+
+		for obj in out_pyobjs:
+			self.send_to_detokenizer.send_pyobj(obj)
+```
+
+This is the control handoff:
+
+- receive loop: collect newly tokenized requests
+- forward loop: ask the model side to advance inference by one scheduler step
+
+The router is not doing string decoding and it is not serving HTTP. It is the middle coordinator that keeps the model busy and forwards generated token IDs downstream.
+
+## 6. Lesson 3 starts here: external request becomes internal scheduler state
+
+Inside `ModelRpcServer.exposed_step(...)`, the router converts transport objects into internal request objects:
+
+```python
+def exposed_step(self, recv_reqs):
+	for recv_req in recv_reqs:
+		if isinstance(recv_req, TokenizedGenerateReqInput):
+			self.handle_generate_request(recv_req)
+
+	self.forward_step()
+
+	ret = self.out_pyobjs
+	self.out_pyobjs = []
+	return ret
+```
+
+Then `handle_generate_request(...)` turns the message into a `Req`:
+
+```python
+def handle_generate_request(self, recv_req):
+	req = Req(recv_req.rid)
+	req.input_ids = recv_req.input_ids
+	req.pixel_values = recv_req.pixel_values
+	req.sampling_params = recv_req.sampling_params
+	req.return_normalized_logprob = recv_req.return_normalized_logprob
+	req.normalized_logprob_start_len = recv_req.normalized_logprob_start_len
+	req.stream = recv_req.stream
+	req.tokenizer = self.tokenizer
+
+	req.input_ids = req.input_ids[: self.model_config.context_len - 1]
+	req.sampling_params.max_new_tokens = min(
+		req.sampling_params.max_new_tokens,
+		self.model_config.context_len - 1 - len(req.input_ids),
+	)
+	self.forward_queue.append(req)
+```
+
+This is an important boundary.
+
+`TokenizedGenerateReqInput` is the message sent between processes.
+
+`Req` is the router's internal working object.
+
+That is where scheduling metadata starts to live, such as:
+
+- `output_ids`
+- `prefix_indices`
+- `finished`
+- `finish_reason`
+- regex FSM state for constrained decoding
+
+## 7. The most important function: `forward_step()`
+
+If you only memorize one scheduler function, memorize this one:
+
+```python
+def forward_step(self):
+	new_batch = self.get_new_fill_batch()
+
+	if new_batch is not None:
+		self.forward_fill_batch(new_batch)
+
+		if not new_batch.is_empty():
+			if self.running_batch is None:
+				self.running_batch = new_batch
+			else:
+				self.running_batch.merge(new_batch)
+	else:
+		if self.running_batch is not None:
+			for _ in range(10):
+				self.forward_decode_batch(self.running_batch)
+				if self.running_batch.is_empty():
+					self.running_batch = None
+					break
+```
+
+This is Lesson 3 in one block.
+
+The router is always deciding between two kinds of work:
+
+- `EXTEND` work for new requests entering the system
+- `DECODE` work for requests already generating tokens
+
+That is the real meaning of the prefill/decode split.
+
+## 8. Why prefix cache and scheduling are discussed together
+
+`get_new_fill_batch()` is where the router estimates how expensive each waiting request is.
+
+```python
+for req in self.forward_queue:
+	prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
+	req.adjust_input_len = len(req.input_ids) - len(prefix_indices)
+	req.prefix_indices = prefix_indices
+	req.last_node = last_node
+
+self.forward_queue = self.scheduler.get_priority_queue(self.forward_queue)
+
+available_size = (
+	self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+)
+```
+
+This is why Lesson 3 spent so much time on the radix cache and scheduler.
+
+The router does not just ask, "which request came first?"
+
+It also asks:
+
+- how much prefix can I reuse?
+- how many fresh prompt tokens do I need to compute?
+- how much KV space is still available?
+- which requests are cheapest or best to admit right now?
+
+The scheduler implementation is tiny, but the policy matters:
+
+```python
+def get_priority_queue(self, forward_queue):
+	if self.schedule_heuristic == "lpm":
+		forward_queue.sort(key=lambda x: -len(x.prefix_indices))
+		return forward_queue
+```
+
+`lpm` means longest-prefix-match first.
+
+So cache reuse is not just a memory optimization. It directly influences admission order.
+
+## 9. What `EXTEND` really does
+
+For a new batch, the router builds the prompt-side tensors and runs one forward pass:
+
+```python
+def forward_fill_batch(self, batch: Batch):
+	batch.init_extend_batch(self.model_config.vocab_size, self.int_token_logit_bias)
+
+	logits, normalized_logprobs = self.model_runner.forward(
+		batch, ForwardMode.EXTEND, batch.return_normalized_logprob
+	)
+
+	next_token_ids, next_token_probs = batch.sample(logits)
+
+	for i in range(len(batch.reqs)):
+		batch.reqs[i].output_ids = [next_token_ids[i]]
+		batch.reqs[i].check_finished()
+```
+
+In plain English:
+
+- build the uncached prompt portion into a batch
+- run the model in `EXTEND` mode
+- sample the first generated token
+- initialize each request's `output_ids`
+
+This is why I prefer the word `extend` over `prefill` when reading this repo. The code is literally extending the already-cached prefix with the uncached suffix.
+
+The batch builder in `infer_batch.py` makes this explicit:
+
+```python
+input_ids = [r.input_ids[len(r.prefix_indices):] for r in reqs]
+prefix_indices = [r.prefix_indices for r in reqs]
+
+extend_num_tokens = seq_lens.sum() - prefix_lens.sum()
+out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+```
+
+That is the concrete meaning of prefix reuse.
+
+The batch only allocates fresh KV slots for tokens that are not already covered by `prefix_indices`.
+
+## 10. What `DECODE` really does
+
+Once a request has already produced at least one token, the router moves into decode mode:
+
+```python
+def forward_decode_batch(self, batch: Batch):
+	self.decode_forward_ct += 1
+	batch.update_for_decode()
+
+	logits = self.model_runner.forward(batch, ForwardMode.DECODE)
+	next_token_ids, next_token_probs = batch.sample(logits)
+
+	for i in range(len(batch.reqs)):
+		batch.reqs[i].output_ids.append(next_token_ids[i])
+		batch.reqs[i].check_finished()
+```
+
+And `update_for_decode()` shows the key difference from `EXTEND`:
+
+```python
+def update_for_decode(self, input_ids=None):
+	if input_ids is None:
+		input_ids = [
+			r.output_ids[-1] if r.output_ids else r.input_ids[-1] for r in self.reqs
+		]
+	self.input_ids = torch.tensor(input_ids, dtype=torch.int32, device="cuda")
+	self.seq_lens.add_(1)
+```
+
+In decode mode, the model no longer reprocesses the whole prompt.
+
+It feeds the last token, advances sequence length, allocates one more KV slot, and predicts one more token.
+
+That is the central efficiency idea behind autoregressive serving.
+
+## 11. Where the real GPU forward call happens
+
+`ModelRunner` is the closest thing to the raw model execution layer in these lessons:
+
+```python
+def forward(self, batch: Batch, forward_mode: ForwardMode, return_normalized_logprob=False):
+	kwargs = {
+		"input_ids": batch.input_ids,
+		"req_pool_indices": batch.req_pool_indices,
+		"seq_lens": batch.seq_lens,
+		"prefix_lens": batch.prefix_lens,
+		"out_cache_loc": batch.out_cache_loc,
+	}
+
+	if forward_mode == ForwardMode.DECODE:
+		kwargs["out_cache_cont_start"] = batch.out_cache_cont_start
+		kwargs["out_cache_cont_end"] = batch.out_cache_cont_end
+		return self.forward_decode(**kwargs)
+	elif forward_mode == ForwardMode.EXTEND:
+		kwargs["return_normalized_logprob"] = return_normalized_logprob
+		return self.forward_extend(**kwargs)
+```
+
+This is the moment where scheduler state becomes actual tensors for the model.
+
+Everything before this prepares work.
+
+Everything after this interprets the result.
+
+## 12. How tokens become streamed text again
+
+After each scheduler step, the router decides whether a request should emit output now:
+
+```python
+if req.finished or (
+	req.stream and self.decode_forward_ct % self.stream_interval == 0
+):
+	output_rids.append(req.rid)
+	output_tokens.append(req.output_ids)
+	output_finished.append(req.finished)
+```
+
+Those token IDs are wrapped into `BatchTokenIDOut` and sent to the detokenizer.
+
+Then `DetokenizerManager` converts them into strings:
+
+```python
+if isinstance(recv_obj, BatchTokenIDOut):
+	output_strs = self.tokenizer.batch_decode(
+		output_tokens,
+		skip_special_tokens=recv_obj.skip_special_tokens[0],
+	)
+
+	self.send_to_tokenizer.send_pyobj(
+		BatchStrOut(
+			recv_obj.rids,
+			output_strs,
+			recv_obj.meta_info,
+			recv_obj.finished,
+		)
+	)
+```
+
+That `BatchStrOut` goes back to `TokenizerManager.handle_loop()`, which calls `state.event.set()`, which wakes the waiting `generate_request(...)`, which yields a chunk to `StreamingResponse`.
+
+That closes the loop.
+
+## 13. The full request lifecycle, now as one connected story
+
+Here is the same path again, but this time tied directly to code behavior.
+
+### Step 1: FastAPI receives a request
+
+`server.py` normalizes the input and calls `tokenizer_manager.generate_request(obj)`.
+
+### Step 2: TokenizerManager turns text into runtime input
+
+`TokenizerManager.generate_request(...)`:
+
+- tokenizes the text
+- builds `SamplingParams`
+- creates `TokenizedGenerateReqInput`
+- sends it to the router with ZeroMQ
+- registers `ReqState` in `rid_to_state`
+- waits on `event`
+
+### Step 3: Router receives the tokenized request
+
+`RouterManager.loop_for_recv_requests()` appends it into `recv_reqs`.
+
+### Step 4: Router advances the model by one step
+
+`RouterManager.loop_for_forward()` calls `model_client.step(next_step_input)`.
+
+### Step 5: ModelRpcServer converts transport objects into internal `Req` objects
+
+`handle_generate_request(...)` truncates prompt length if needed, stores sampling config, and pushes the request into `forward_queue`.
+
+### Step 6: Scheduler decides between extend and decode
+
+`forward_step()`:
+
+- tries to create a new fill batch
+- if successful, runs `EXTEND`
+- otherwise continues `DECODE` on `running_batch`
+
+### Step 7: Prefix cache reduces repeated prompt work
+
+`get_new_fill_batch()` uses `tree_cache.match_prefix(req.input_ids)` to find reusable KV cache.
+
+### Step 8: ModelRunner executes the forward pass
+
+`ModelRunner.forward(...)` dispatches to `forward_extend(...)` or `forward_decode(...)`.
+
+### Step 9: Router samples tokens and checks finish conditions
+
+`Req.check_finished()` stops on:
+
+- max token length
+- EOS token
+- stop string
+
+### Step 10: Router emits token IDs for streaming or final output
+
+`handle_finished_requests(...)` builds `BatchTokenIDOut`.
+
+### Step 11: Detokenizer turns token IDs into strings
+
+`DetokenizerManager.handle_loop()` calls `batch_decode(...)` and sends `BatchStrOut` back.
+
+### Step 12: TokenizerManager wakes the waiting request coroutine
+
+`handle_loop()` writes into `rid_to_state[rid]` and calls `state.event.set()`.
+
+### Step 13: FastAPI streams the text chunk to the client
+
+The async generator yields the newest output chunk, and `StreamingResponse` sends it immediately.
+
+## 14. Why the first three lessons were ordered this way
+
+The lesson order is actually good. It only feels confusing if you do not yet see the single pipeline.
+
+The dependency chain is:
+
+1. First understand the process boundaries.
+2. Then understand how one request waits for results without blocking.
+3. Then understand how the router decides what the model should run next.
+
+If you reverse that order, the router code looks much more abstract than it really is.
+
+## 15. What to remember after reading this note
+
+If you forget details, keep these five facts:
+
+1. Inference is a pipeline, not a single function call.
+2. `TokenizerManager` is the bridge between HTTP and runtime messages.
+3. The router's core decision is always `EXTEND` versus `DECODE`.
+4. Prefix caching affects both memory reuse and scheduling priority.
+5. Streaming works because one coroutine waits on `asyncio.Event` while another coroutine fills results and signals it.
+
+## 16. Best next files to reread
+
+If you want to revisit the first three lessons with much less confusion, reread these in this order:
+
+1. `python/sglang/srt/server.py`
+2. `python/sglang/srt/managers/tokenizer_manager.py`
+3. `python/sglang/srt/managers/router/manager.py`
+4. `python/sglang/srt/managers/router/model_rpc.py`
+5. `python/sglang/srt/managers/router/infer_batch.py`
+6. `python/sglang/srt/managers/detokenizer_manager.py`
+
+That order follows the same direction as an actual inference request.

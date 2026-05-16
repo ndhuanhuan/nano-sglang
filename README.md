@@ -37,32 +37,40 @@ nano-sglang is created to help developers understand the internal workings of mo
 
 ### Installation
 
+Requires Python 3.9+. The optional `triton` dependency is only installed on Linux x86_64, which matches the CUDA-oriented runtime in this repo. Optional `flashinfer-python==0.6.4` requires Python 3.10+ and a supported CUDA environment, so it should be treated as a separate accelerator path rather than part of the base setup.
+
 ```bash
 # Clone the repository
 git clone https://github.com/your-username/nano-sglang.git
 cd nano-sglang/python
 
-# Install with all dependencies
-pip install -e ".[all]"
+# Create and activate a virtual environment
+uv venv
+source .venv/bin/activate
+
+# Install the project in editable mode with all optional dependencies
+uv sync --extra all
 
 # Optional: Install flashinfer for acceleration
-pip install flashinfer-python==0.6.4 --no-build-isolation
+# Requires Python 3.10+ and a supported CUDA environment.
+uv pip install flashinfer-python==0.6.4 --no-build-isolation
 ```
 
 ### Basic Usage
 
 ```bash
 # Basic server launch
-python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+uv run python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 
 # With tensor parallelism
-python3 -m sglang.launch_server --model-path /path/to/llama2-model --port 30000 --tp 2
+uv run python -m sglang.launch_server --model-path /path/to/llama2-model --port 30000 --tp-size 2
 
 # With AWQ quantization
-python3 -m sglang.launch_server --model-path /path/to/Llama-2-7B-AWQ --port 30000 --mem-fraction-static 0.8
+uv run python -m sglang.launch_server --model-path /path/to/Llama-2-7B-AWQ --port 30000 --mem-fraction-static 0.8
 
 # With flashinfer acceleration
-python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --model-mode flashinfer
+# Requires flashinfer to be installed successfully first.
+uv run python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000 --model-mode flashinfer
 ```
 
 ### API Usage
