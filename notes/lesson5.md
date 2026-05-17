@@ -240,7 +240,216 @@ The current repo would likely need at least three structural additions:
 
 In other words, the current `Req` and `forward_queue` logic would need one more state: not just waiting or running, but waiting-with-partial-prefill-progress.
 
-## 13. What to remember after Lesson 5
+## 13. How chunked prefill would modify the current `model_rpc.py` flow
+
+The easiest way to see the design change is to compare the current `model_rpc.py` flow with a chunk-aware version.
+
+Right now the path is basically:
+
+```text
+handle_generate_request
+	-> push Req into forward_queue
+get_new_fill_batch
+	-> either admit the whole request or leave it queued
+forward_fill_batch
+	-> finish prompt prefill for that request in one go
+	-> produce first token
+	-> move request into running_batch for decode
+```
+
+Chunked prefill would change the meaning of the fill path.
+
+Instead of treating prefill as all-or-nothing, the router would have to treat it as resumable progress.
+
+### 13.1 `Req` would need explicit prefill progress
+
+Today `Req` mainly tracks:
+
+- full `input_ids`
+- reusable `prefix_indices`
+- `adjust_input_len`
+- generated `output_ids`
+
+For chunked prefill, it would need one more concept: how much of the uncached prompt has already been prefetched.
+
+A pseudo-diff would look like:
+
+```python
+class Req:
+    def __init__(self, rid):
+        self.rid = rid
+        self.input_ids = []
+        self.output_ids = []
+        ...
+        self.prefix_indices = []
+        self.adjust_input_len = 0
+
++       # new: chunked-prefill progress inside the uncached suffix
++       self.prefill_cursor = 0
++       self.in_prefill = True
+```
+
+The purpose of `prefill_cursor` would be:
+
+- `prefix_indices` tracks already-cached old prefix
+- `prefill_cursor` tracks newly-prefilled suffix progress for this request
+
+That distinction matters because chunked prefill creates a new kind of prefix: not only radix-cache hits from old requests, but also prompt progress made by this same request in earlier rounds.
+
+### 13.2 `get_new_fill_batch()` would choose a chunk, not the whole suffix
+
+Today the current code computes:
+
+```python
+req.adjust_input_len = len(req.input_ids) - len(prefix_indices)
+```
+
+and then reasons about the whole remaining uncached prompt.
+
+With chunked prefill, the router would instead slice that uncached remainder into a per-round chunk:
+
+```python
+remaining_prefill = req.adjust_input_len - req.prefill_cursor
+chunk_len = min(
+    remaining_prefill,
+    chunked_prefill_size,
+    self.max_prefill_num_token - new_batch_input_tokens,
+)
+```
+
+Then the admission decision would no longer mean "can the whole request enter?"
+
+It would mean:
+
+Can the next prefill chunk of this request enter?
+
+That is the deepest scheduler change.
+
+### 13.3 The batch builder would need to consume only the next chunk
+
+Today `Batch.init_extend_batch()` effectively uses:
+
+```python
+input_ids = [r.input_ids[len(r.prefix_indices):] for r in reqs]
+```
+
+That assumes one fill batch consumes the whole uncached suffix.
+
+With chunked prefill, the batch builder would instead need a bounded slice:
+
+```python
+start = len(r.prefix_indices) + r.prefill_cursor
+end = start + r.chunk_len
+input_ids = [r.input_ids[start:end] for r in reqs]
+```
+
+So the extend batch would no longer mean:
+
+- all uncached prompt tokens
+
+It would mean:
+
+- only the next chunk of uncached prompt tokens
+
+### 13.4 `forward_fill_batch()` could no longer always produce the first decode token
+
+Today the code assumes one extend pass reaches decode readiness:
+
+```python
+next_token_ids, next_token_probs = batch.sample(logits)
+
+for i in range(len(reqs)):
+    reqs[i].output_ids = [next_token_ids[i]]
+    reqs[i].check_finished()
+```
+
+That is only valid because current prefill finishes the request's whole prompt before sampling the first new token.
+
+With chunked prefill, there would be two cases:
+
+1. this chunk does not finish prompt prefill yet
+2. this chunk completes the final prefill segment and can now sample the first output token
+
+So the logic would need a branch like this:
+
+```python
+for req in batch.reqs:
+    req.prefill_cursor += req.chunk_len
+
+    if req.prefill_cursor < req.adjust_input_len:
+        # prompt is still incomplete; requeue for next prefill round
+        req.in_prefill = True
+        chunked_requeue.append(req)
+    else:
+        # prompt is now complete; sample first decode token
+        req.in_prefill = False
+        req.output_ids = [next_token_id]
+        decode_ready.append(req)
+```
+
+This is the control-flow point where a chunked request stops being "prefill-in-progress" and becomes a normal decode request.
+
+### 13.5 Partially-prefilled requests would need to re-enter the queue ahead of untouched requests
+
+Today requests are removed from `forward_queue` when admitted and then either:
+
+- move to `running_batch` for decode
+- or finish
+
+Chunked prefill would add a third destination:
+
+- go back to the front of the fill queue because prompt prefill is only partially complete
+
+Pseudo-diff:
+
+```python
+new_batch = Batch(can_run_list, ...)
+remaining_queue = [x for x in self.forward_queue if x not in can_run_list]
+
++self.forward_queue = chunked_requeue + remaining_queue
+```
+
+That is how the article's `ChunkedReq` priority behavior would show up in this repo's current structure.
+
+### 13.6 `handle_finished_requests()` would stay mostly a decode/finalization path
+
+One useful simplification is that partially-prefilled requests should not go through normal "finished request" cleanup yet.
+
+They still own active request rows and newly-allocated KV slots.
+
+So the likely design would be:
+
+- partial prefill progress updates request state in-place
+- only decode-ready or truly finished requests go through the existing output and cleanup logic
+
+That means chunked prefill is mostly a change to:
+
+- queue state
+- extend-batch slicing
+- transition conditions between prefill and decode
+
+rather than a complete rewrite of the decode path.
+
+### 13.7 The shortest pseudo-diff summary
+
+If you want the shortest possible summary, chunked prefill would change `model_rpc.py` like this:
+
+```text
+current:
+    waiting request -> one full extend -> first token -> decode
+
+chunked:
+    waiting request -> extend chunk 1 -> extend chunk 2 -> ...
+    -> final extend chunk -> first token -> decode
+```
+
+So the essential modification is not in the math kernel.
+
+It is in the request state machine.
+
+`Req` would no longer be only "waiting for first fill" or "running decode." It would also need a middle state: "partially-prefilled prompt, needs another fill chunk."
+
+## 14. What to remember after Lesson 5
 
 If you forget the details, remember these six facts:
 
@@ -251,7 +460,7 @@ If you forget the details, remember these six facts:
 5. This repo currently enforces only a coarse prefill-token cap.
 6. So the article describes a more advanced scheduling strategy than what this repo implements today.
 
-## 14. Best files to reread after this lesson
+## 15. Best files to reread after this lesson
 
 For the current repo, reread these to understand the non-chunked baseline:
 

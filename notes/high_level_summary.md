@@ -914,3 +914,162 @@ If you want the shortest review version, remember these five points:
 3. A chunked request carries unfinished prompt state into the next scheduler round.
 4. The article's implementation uses dedicated chunk-aware request handling.
 5. This repo currently has only a coarse prefill-token cap, not the full chunked-prefill flow.
+
+## 21. Lesson 6 in one pass: AWQ changes linear layers by swapping the weight format and math kernel
+
+Lesson 6 is about how the runtime recognizes a quantized model and routes linear layers onto the correct implementation.
+
+The key entry point is `ModelRunner.load_model()`:
+
+```python
+hf_quant_config = getattr(
+	self.model_config.hf_config, "quantization_config", None
+)
+if hf_quant_config is not None:
+	quant_config = AWQConfig.from_config(hf_quant_config)
+	linear_method = quant_config.get_linear_method()
+model = model_class(
+	config=self.model_config.hf_config, linear_method=linear_method
+)
+```
+
+That means AWQ is detected from `quantization_config`, then expressed as a `linear_method` strategy that gets threaded through attention and MLP projections.
+
+The most important consequence is that AWQ linear layers do not store one FP16 `weight` tensor. They store:
+
+1. `qweight`
+2. `qzeros`
+3. `scales`
+
+and the same forward call site:
+
+```python
+output_parallel = self.linear_method.apply_weights(
+	self.linear_weights, input_parallel
+)
+```
+
+dispatches either to ordinary `F.linear(...)` or to the AWQ Triton path.
+
+## 22. What to remember from Lesson 6
+
+If you want the shortest review version, remember these five points:
+
+1. AWQ detection starts from `quantization_config` in the model config.
+2. The repo injects quantization through `linear_method`, not through separate model classes.
+3. AWQ weights are stored as packed `qweight`, `qzeros`, and `scales`.
+4. Tensor-parallel loading works because packed tensors carry metadata like `packed_dim` and `pack_factor`.
+5. The actual quantized GEMM path ends in `awq_gemm_triton(...)`, not in `torch.linear`.
+
+## 23. Lesson 7 in one pass: the AWQ kernel unpacks int4 weights inside the GEMM loop
+
+Lesson 7 zooms in on the Triton kernel itself.
+
+Its goal is simple:
+
+- input `A`: normal activations `[M, K]`
+- input `B`: packed AWQ weights `qweight[K, N/8]`
+- metadata: `qzeros[K/G, N/8]` and `scales[K/G, N]`
+- output `C`: normal dense result `[M, N]`
+
+The wrapper launches:
+
+```python
+awq_gemm_kernel[grid](
+	input,
+	qweight,
+	result,
+	qzeros,
+	scales,
+	M,
+	N,
+	K,
+	group_size,
+	...
+)
+```
+
+Inside the kernel, each K-loop chunk does four things:
+
+1. load one block of activations and packed weights
+2. unpack int4 values with bit shifts and AWQ reorder
+3. load the matching zero-points and scales for the current quantization group
+4. dequantize in registers and immediately do `tl.dot(a, b)`
+
+The core math is:
+
+```python
+b = (b >> shifts) & 0xF
+zeros = (zeros >> shifts) & 0xF
+b = (b - zeros) * scales
+accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
+```
+
+So the kernel never fully dequantizes the whole weight matrix first. It unpacks and dequantizes only the block it is about to multiply.
+
+## 24. What to remember from Lesson 7
+
+If you want the shortest review version, remember these five points:
+
+1. `qweight` packs 8 four-bit weights into each `int32`, so the logical `[K, N]` matrix is stored physically as `[K, N/8]`.
+2. The kernel restores the AWQ packing order with a fixed shift pattern before extracting 4-bit values.
+3. `qzeros` and `scales` are indexed by quantization group along K, not by every individual weight element.
+4. Dequantization happens block by block inside the kernel, immediately before `tl.dot(...)`.
+5. Split-K parallelism is handled by writing partial results to `[SPLIT_K, M, N]` and summing them afterward.
+
+## 25. Lesson 8 in one pass: multimodal inference adds image preprocessing before `EXTEND` and reuses normal `DECODE`
+
+Lesson 8 is about where image input enters the same runtime you already learned.
+
+The first fork is in `TokenizerManager`:
+
+```python
+if is_multimodal_model(self.model_path):
+	self.processor = get_processor(...)
+	self.tokenizer = self.processor.tokenizer
+```
+
+So a multimodal request gets both text tokenization and image preprocessing:
+
+```python
+pixel_values = processor.image_processor(image)["pixel_values"][0]
+image_hash = hash(image_data)
+```
+
+Then the router expands the single image token into many placeholder positions:
+
+```python
+req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
+	req.input_ids, pad_value
+)
+```
+
+and `Batch.init_extend_batch(...)` carries `pixel_values` and `image_offsets` into the model.
+
+The key fusion happens in `LlavaLlamaForCausalLM.forward(...)` during `EXTEND`:
+
+```python
+input_embeds = self.language_model.model.embed_tokens(input_ids)
+image_features = self.multi_modal_projector(selected_image_feature)
+input_embeds[start_idx + image_offsets[i] : start_idx + image_offsets[i] + pad_len] = image_features[pt]
+```
+
+So the model does not create a separate decode engine for images.
+
+It replaces the placeholder embedding region with projected vision features once, then calls the normal language model.
+
+That is why `DECODE` stays simple:
+
+```python
+return self.language_model(input_ids, positions, input_metadata, skip_embed=False)
+```
+
+## 26. What to remember from Lesson 8
+
+If you want the shortest review version, remember these five points:
+
+1. This repo currently recognizes LLaVA-style models as the multimodal path.
+2. Multimodal requests use `processor` plus image preprocessing, not just `tokenizer`.
+3. The router expands one `<image>` token into `image_feature_len` placeholder positions before `EXTEND`.
+4. `EXTEND` overwrites those placeholder embeddings with projected vision features.
+5. After that fusion step, `DECODE` reuses the ordinary text-model path and KV cache flow.
