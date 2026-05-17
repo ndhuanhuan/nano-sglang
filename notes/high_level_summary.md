@@ -214,6 +214,93 @@ So the important distinction is:
 
 Only the waiting HTTP coroutine is "not polling." The overall system is still making progress in the background.
 
+### If `asyncio.Event` still feels abstract, use this mental model
+
+Think of `asyncio.Event` as a doorbell, not a mailbox.
+
+- `state.out_list` stores the actual text chunk
+- `state.event` only answers: should this coroutine wake up now?
+
+So `Event` does not carry the result itself. It only coordinates when the waiting coroutine should continue.
+
+The pattern in this file is:
+
+```python
+state.out_list.append(out_dict)
+state.event.set()
+```
+
+That means:
+
+1. put the new result somewhere the request can read it
+2. ring the bell so the waiting coroutine wakes up
+
+Then the request coroutine does:
+
+```python
+await event.wait()
+yield state.out_list[-1]
+event.clear()
+```
+
+That means:
+
+1. sleep until the bell rings
+2. read the newest result
+3. reset the bell for the next chunk
+
+### What `await` actually does here
+
+The subtle point is that `await` does not freeze the whole Python process.
+
+It only pauses this one coroutine.
+
+So when execution reaches:
+
+```python
+await event.wait()
+```
+
+the event loop can still run:
+
+- `TokenizerManager.handle_loop()`
+- other HTTP requests
+- socket I/O
+- other background async tasks
+
+That is why the server can keep working while this request is waiting for more tokens.
+
+### Exact timeline for one request
+
+```text
+1. generate_request(rid) sends the tokenized request to the router
+2. generate_request(rid) reaches await event.wait() and pauses
+3. the event loop runs other work while this coroutine is paused
+4. router and detokenizer finish another chunk for rid
+5. handle_loop() receives BatchStrOut for rid
+6. handle_loop() writes the text into rid_to_state[rid].out_list
+7. handle_loop() calls rid_to_state[rid].event.set()
+8. the event loop marks generate_request(rid) runnable again
+9. generate_request(rid) resumes after await event.wait()
+10. generate_request(rid) yields the chunk to StreamingResponse
+```
+
+The key phrase is "marks runnable again."
+
+`event.set()` does not directly jump into the other coroutine. It tells the event loop that this waiting coroutine is now allowed to continue on the next scheduling turn.
+
+### Why `rid_to_state` matters so much
+
+Each request gets its own state object:
+
+- its own output buffer
+- its own `Event`
+- its own finished flag
+
+That is why the code uses `rid_to_state[rid]`.
+
+Without that mapping, the runtime would not know which sleeping request coroutine should wake up when a particular output chunk arrives.
+
 ## 4. The return path is another loop, not a callback
 
 The background producer is `TokenizerManager.handle_loop()`:
@@ -648,3 +735,182 @@ If you want to revisit the first three lessons with much less confusion, reread 
 6. `python/sglang/srt/managers/detokenizer_manager.py`
 
 That order follows the same direction as an actual inference request.
+
+## 17. Lesson 4 in one pass: memory pools make prefix reuse real
+
+Lesson 4 adds the missing memory model behind Lesson 3.
+
+The scheduler is not just choosing requests. It is also reasoning about whether the KV-cache system can represent those requests safely and efficiently.
+
+The runtime uses three cooperating structures:
+
+1. `RadixCache`: remembers reusable prompt prefixes.
+2. `ReqToTokenPool`: maps each live request row to the KV-slot index of each token position.
+3. `TokenToKVPool`: owns the actual KV tensors on GPU and tracks slot reference counts.
+
+The pools are created in `ModelRunner.init_memory_pool(...)`:
+
+```python
+self.req_to_token_pool = ReqToTokenPool(...)
+self.token_to_kv_pool = TokenToKVPool(...)
+```
+
+The flow for one request is:
+
+### Step 1: match cached prefix
+
+The router asks the radix tree how much of the prompt is already cached:
+
+```python
+prefix_indices, last_node = self.tree_cache.match_prefix(req.input_ids)
+req.adjust_input_len = len(req.input_ids) - len(prefix_indices)
+req.prefix_indices = prefix_indices
+req.last_node = last_node
+```
+
+So `prefix_indices` is the concrete list of reusable KV slots for that prompt prefix.
+
+### Step 2: extend allocates only the uncached suffix
+
+During prefill/extend, the batch builder reuses the cached prefix and allocates new slots only for the remaining prompt suffix:
+
+```python
+input_ids = [r.input_ids[len(r.prefix_indices):] for r in reqs]
+req_pool_indices = self.req_to_token_pool.alloc(bs)
+out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+```
+
+That is the whole trick: shared prefix stays shared, only new tokens consume new KV memory.
+
+### Step 3: decode appends one KV slot per token step
+
+For active requests, decode grows the sequence incrementally:
+
+```python
+self.seq_lens.add_(1)
+self.out_cache_loc = self.token_to_kv_pool.alloc(bs)
+self.req_to_token_pool.req_to_token[
+	self.req_pool_indices, self.seq_lens - 1
+] = self.out_cache_loc
+```
+
+So decode is just "add one more token slot per live request."
+
+### Step 4: finishing a request does not blindly delete the cache
+
+When a request finishes, the runtime inserts its token sequence into the radix cache, frees the request row, and decreases reference counts:
+
+```python
+prefix_len = self.tree_cache.insert(token_ids[:seq_len], indices.clone())
+self.token_to_kv_pool.free(indices[:prefix_len])
+self.req_to_token_pool.free(req_pool_idx)
+self.tree_cache.dec_ref_counter(req.last_node)
+```
+
+This is the key Lesson 4 idea.
+
+Completion means "drop request-specific ownership" rather than "erase all KV memory immediately."
+
+### Step 5: eviction reclaims only unused cache
+
+If new allocation fails, the runtime asks the radix tree to evict old leaves with ref count 0:
+
+```python
+out_cache_loc = self.token_to_kv_pool.alloc(extend_num_tokens)
+if out_cache_loc is None:
+	self.tree_cache.evict(extend_num_tokens, self.token_to_kv_pool.free)
+```
+
+So eviction is guided by cache structure and reference counts, not by blindly scanning tensors.
+
+### A concrete example: `Write a poem about cats`
+
+Suppose a previous request already cached the prefix `Write a poem about`, and that prefix maps to KV slots `[101, 102, 103, 104]`.
+
+Now a new prompt arrives:
+
+```text
+Write a poem about cats
+-> [11, 12, 13, 14, 15]   # illustrative token IDs only
+```
+
+Then the three structures cooperate like this:
+
+1. `RadixCache.match_prefix(...)` returns the reusable prefix slots `[101, 102, 103, 104]`.
+2. `ReqToTokenPool` allocates one request row, for example row `7`.
+3. `TokenToKVPool` allocates only one new slot for the uncached token `cats`, for example slot `220`.
+
+So the logical request row becomes:
+
+```text
+row 7 = [101, 102, 103, 104, 220]
+```
+
+Then decode appends more slots, one token at a time, such as `221`, `222`, and so on.
+
+The important point is that the shared prefix is reused, not duplicated. Only the uncached suffix and later generated tokens consume new KV memory.
+
+## 18. What to remember from Lesson 4
+
+If you want the shortest review version, remember these five points:
+
+1. `RadixCache` tells the router what prefix KV memory can be reused.
+2. `ReqToTokenPool` is the per-request index table.
+3. `TokenToKVPool` is the actual GPU KV memory with reference counts.
+4. Extend allocates only uncached prompt tokens; decode allocates one new token at a time.
+5. Finished requests free their own ownership, but reusable cache can stay alive until eviction is needed.
+
+## 19. Lesson 5 in one pass: chunked prefill splits long prompts into smaller forward passes
+
+Lesson 5 is about a limitation of the earlier design.
+
+Even if the KV-cache accounting is correct, a very long prefill can still be expensive because the prompt-side forward pass has large activation memory cost. Chunked prefill solves that by processing one long prompt in multiple smaller prefill rounds instead of one huge one.
+
+The article explains two related controls in full sglang:
+
+1. a total per-forward prefill budget
+2. a per-request chunk size
+
+In the article's minisglang implementation, the key idea is simplified into one budget-like control, `max_extend_tokens`, and the scheduler may return either:
+
+- a normal request that finishes prefill this round
+- a chunked request that still has prompt tokens left for a later prefill round
+
+The important behavioral change is this:
+
+- without chunked prefill, a request is admitted whole or not at all
+- with chunked prefill, one long request can make partial progress and come back next round
+
+This repo does not yet implement that full chunked-prefill mechanism.
+
+What it has today is a batch-wide prefill cap:
+
+```python
+self.max_prefill_num_token = max(
+	self.model_config.context_len, self.max_total_num_token // 6
+)
+```
+
+and an admission check in `get_new_fill_batch()`:
+
+```python
+if (
+	req.adjust_input_len + req.max_new_tokens() + new_batch_total_tokens
+	< available_size
+	and req.adjust_input_len + new_batch_input_tokens
+	< self.max_prefill_num_token
+):
+	can_run_list.append(req)
+```
+
+That limits total prompt work in one batch, but it does not split a single request into multiple prefill chunks. So the current repo has a prefill budget guard, not true chunked prefill.
+
+## 20. What to remember from Lesson 5
+
+If you want the shortest review version, remember these five points:
+
+1. Chunked prefill exists to reduce activation-memory spikes from very long prompt prefill.
+2. It can also improve utilization by filling leftover prefill budget with partial work from long requests.
+3. A chunked request carries unfinished prompt state into the next scheduler round.
+4. The article's implementation uses dedicated chunk-aware request handling.
+5. This repo currently has only a coarse prefill-token cap, not the full chunked-prefill flow.
